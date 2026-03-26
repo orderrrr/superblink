@@ -56,7 +56,13 @@ function source:get_completions(context, callback)
       callback({ items = {}, is_incomplete_forward = false })
       return
     end
-    self:_do_request(context, bufnr, filepath, callback)
+    local ok, err = pcall(function()
+      self:_do_request(context, bufnr, filepath, callback)
+    end)
+    if not ok then
+      vim.notify("[superblink] request error: " .. tostring(err), vim.log.levels.DEBUG)
+      callback({ items = {}, is_incomplete_forward = false })
+    end
   end)
 end
 
@@ -96,9 +102,15 @@ function source:_do_request(context, bufnr, filepath, callback)
 
       vim.schedule(function()
         if result.code ~= 0 or not result.stdout or result.stdout == "" then
+          if result.code == 28 or result.code == 7 then
+            server.mark_down() -- timeout or connection refused → re-check next time
+          end
           callback({ items = {}, is_incomplete_forward = false })
           return
         end
+
+        -- Server responded successfully
+        server.confirm_alive()
 
         local ok, data = pcall(vim.fn.json_decode, result.stdout)
         if not ok or not data or not data.completion or data.completion == "" then
@@ -127,7 +139,6 @@ function source:_do_request(context, bufnr, filepath, callback)
           newText = completion,
         }
 
-        -- Primary: the full completion
         table.insert(items, {
           label = keyword .. first_line(completion),
           kind = vim.lsp.protocol.CompletionItemKind.Text,

@@ -30,8 +30,9 @@ log = logging.getLogger("superblink")
 # Config
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-coder-v2:16b")
 MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "8"))
+MAX_RAG_CHARS = int(os.getenv("MAX_RAG_CHARS", "7250"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "128"))
 CHUNK_MAX_LINES = int(os.getenv("CHUNK_MAX_LINES", "60"))
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(512 * 1024)))  # 512KB
@@ -184,6 +185,7 @@ CHUNK_BOUNDARY = re.compile(
     r"|(?:pub(?:\(crate\))?\s+)?(?:fn|struct|enum|impl|mod|trait|type)\s+"  # rust
     r"|(?:func)\s+"  # go
     r"|(?:typedef|struct|enum|union|static|inline)\s+"  # c/c++
+    r"|(?:local\s+)?function\s+"  # lua
     r")",
     re.MULTILINE,
 )
@@ -428,6 +430,16 @@ def detect_git_root(filepath: str) -> str | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-load the model in Ollama so first completion is fast
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": "", "keep_alive": "30m"},
+            )
+        log.info("Model pre-loaded: %s", OLLAMA_MODEL)
+    except Exception as e:
+        log.warning("Could not pre-load model: %s", e)
     yield
     for obs in observers.values():
         obs.stop()
@@ -517,10 +529,8 @@ async def complete(req: CompletionRequest):
         parts = [f"// --- {c.filepath}:{c.lineno} ---\n{c.content}" for c in chunks]
         rag_block = "\n\n".join(parts) + "\n\n"
 
-    # Cap total prompt size to avoid blowing past the model's context window
-    budget = MAX_PROMPT_CHARS - len(prefix) - len(suffix) - 200  # headroom for tokens
-    if len(rag_block) > budget:
-        rag_block = rag_block[:budget]
+    if len(rag_block) > MAX_RAG_CHARS:
+        rag_block = rag_block[:MAX_RAG_CHARS]
 
     prompt = (
         f"{tpl['prefix']}"
@@ -530,6 +540,13 @@ async def complete(req: CompletionRequest):
         f"{tpl['suffix']}"
         f"{suffix}"
         f"{tpl['middle']}"
+    )
+
+    log.info(
+        "prompt: %d chars, rag: %d chars, chunks: %d",
+        len(prompt),
+        len(rag_block),
+        len(chunks),
     )
 
     # --- Call Ollama ---
@@ -554,6 +571,7 @@ async def _ollama_generate(prompt: str, tpl: dict) -> str:
                     "prompt": prompt,
                     "raw": True,
                     "stream": False,
+                    "keep_alive": "30m",
                     "options": {
                         "num_predict": MAX_TOKENS,
                         "temperature": 0.2,

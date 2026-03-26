@@ -9,7 +9,7 @@ local M = {}
 local _process = nil
 local _health_cache = nil
 local _health_cache_time = 0
-local HEALTH_CACHE_TTL = 5 -- seconds
+local _server_confirmed = false -- true after first successful response
 
 -- Resolve plugin root from this file's location:
 -- this file is at <plugin_root>/lua/superblink/server.lua
@@ -71,6 +71,7 @@ function M.start()
   env.OLLAMA_MODEL = config.ollama_model
   env.OLLAMA_URL = config.ollama_url
   env.MAX_CONTEXT_CHUNKS = tostring(config.max_context_chunks)
+  env.MAX_RAG_CHARS = tostring(config.max_rag_chars)
   env.MAX_TOKENS = tostring(config.max_tokens)
 
   -- Python logging uses "warning" not "warn"
@@ -184,22 +185,31 @@ local function http_request(method, path, body, timeout_s, callback)
   end)
 end
 
+--- Mark the server as confirmed running (called after a successful /complete response).
+function M.confirm_alive()
+  _server_confirmed = true
+end
+
+--- Mark the server as down (called after a failed /complete request).
+function M.mark_down()
+  _server_confirmed = false
+end
+
 --- Ensure the server is running before a completion request.
---- Checks health first (handles externally-started servers), only starts if unreachable.
+--- Fast path: once server has responded successfully, skip health checks entirely.
+--- Only does a health check on first call or after a failure.
 --- @param callback fun(healthy: boolean)
 function M.ensure_running(callback)
-  -- Check cache first
-  local now = vim.uv.now() / 1000 -- ms -> seconds
-  if _health_cache ~= nil and (now - _health_cache_time) < HEALTH_CACHE_TTL then
-    callback(_health_cache)
+  -- Fast path: server already confirmed alive, skip health check entirely
+  if _server_confirmed then
+    callback(true)
     return
   end
 
-  -- Always check health first — server may already be running (manually or from previous session)
+  -- First time or after failure: check if server is reachable
   http_request("GET", "/health", nil, 2, function(ok, _)
     if ok then
-      _health_cache = true
-      _health_cache_time = vim.uv.now() / 1000
+      _server_confirmed = true
       callback(true)
       return
     end
@@ -209,14 +219,11 @@ function M.ensure_running(callback)
       M.start()
       vim.defer_fn(function()
         http_request("GET", "/health", nil, 2, function(started_ok, _)
-          _health_cache = started_ok
-          _health_cache_time = vim.uv.now() / 1000
+          _server_confirmed = started_ok
           callback(started_ok)
         end)
       end, 1500)
     else
-      _health_cache = false
-      _health_cache_time = vim.uv.now() / 1000
       callback(false)
     end
   end)

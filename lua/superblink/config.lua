@@ -3,11 +3,12 @@
 
 local M = {
   server_url = "http://127.0.0.1:7878",
-  timeout_ms = 5000,
+  timeout_ms = 30000,
   auto_start = true,
-  ollama_model = "qwen2.5-coder:1.5b",
+  ollama_model = "deepseek-coder-v2:16b",
   ollama_url = "http://localhost:11434",
   max_context_chunks = 8,
+  max_rag_chars = 7250,
   max_tokens = 128,
   log_level = "warn",
   python_cmd = "python3",
