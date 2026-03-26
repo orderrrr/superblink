@@ -1,0 +1,275 @@
+*superblink.txt*  Project-aware FIM completions for blink.cmp
+
+Author:  superblink contributors
+License: See LICENSE file
+
+==============================================================================
+CONTENTS                                                 *superblink-contents*
+
+    1. Overview .............. |superblink-overview|
+    2. Requirements .......... |superblink-requirements|
+    3. Installation .......... |superblink-installation|
+    4. Configuration ......... |superblink-config|
+    5. Commands .............. |superblink-commands|
+    6. Indexing and RAG ...... |superblink-rag|
+    7. Troubleshooting ....... |superblink-troubleshooting|
+
+==============================================================================
+1. OVERVIEW                                              *superblink-overview*
+
+Superblink provides local, project-aware code completions through blink.cmp.
+It runs a Python server that builds a BM25 index over your codebase, retrieves
+relevant chunks at completion time, and feeds them as context into an Ollama
+FIM (fill-in-the-middle) model. The result is returned as a blink.cmp
+completion item.
+
+Architecture: >
+
+    blink.cmp source -> superblink server (BM25 RAG) -> Ollama (FIM model)
+<
+The blink.cmp source sends the current buffer contents and cursor position to
+the server. The server detects the git root, indexes the project on first
+request, retrieves relevant code chunks via BM25 ranking, constructs a FIM
+prompt, and queries Ollama. The completion is returned to blink.cmp for
+display in the completion menu.
+
+No per-project configuration is needed. Open a file and type.
+
+==============================================================================
+2. REQUIREMENTS                                      *superblink-requirements*
+
+- Neovim >= 0.10
+- Python >= 3.11
+- Ollama (https://ollama.com)
+- blink.cmp (https://github.com/saghen/blink.cmp)
+
+Python packages (installed via `pip install -r server/requirements.txt`):
+
+    fastapi, uvicorn, httpx, rank_bm25, watchdog
+
+==============================================================================
+3. INSTALLATION                                      *superblink-installation*
+
+Pull the FIM model first: >bash
+
+    ollama pull qwen2.5-coder:1.5b
+<
+Install Python dependencies: >bash
+
+    cd server && pip install -r requirements.txt
+<
+lazy.nvim example: >lua
+
+    {
+      "your-user/superblink",
+      dependencies = { "saghen/blink.cmp" },
+      config = function()
+        require("superblink").setup({
+          -- see |superblink-config| for all options
+        })
+      end,
+    }
+<
+Register the source in your blink.cmp config: >lua
+
+    {
+      "saghen/blink.cmp",
+      opts = {
+        sources = {
+          default = { "lsp", "path", "superblink" },
+          providers = {
+            superblink = {
+              name = "superblink",
+              module = "blink.cmp.sources.superblink",
+            },
+          },
+        },
+      },
+    }
+<
+==============================================================================
+4. CONFIGURATION                                          *superblink-config*
+
+Pass options to `require("superblink").setup(opts)`. All fields are optional;
+defaults are shown below.
+
+                                                   *superblink-config-table*
+>lua
+    require("superblink").setup({
+      server_url         = "http://127.0.0.1:7878",
+      timeout_ms         = 5000,
+      auto_start         = true,
+      ollama_model       = "qwen2.5-coder:1.5b",
+      ollama_url         = "http://localhost:11434",
+      max_context_chunks = 8,
+      max_tokens         = 128,
+      log_level          = "warn",
+      python_cmd         = "python3",
+      server_port        = 7878,
+    })
+<
+Fields:
+
+`server_url`                                      *superblink-config.server_url*
+    Type: string
+    Default: `"http://127.0.0.1:7878"`
+
+    Base URL for the superblink server. If you change `server_port` but not
+    `server_url`, the URL is updated automatically to match the port.
+
+`timeout_ms`                                      *superblink-config.timeout_ms*
+    Type: number
+    Default: `5000`
+
+    Timeout in milliseconds for completion requests sent to the server.
+    Minimum value: 100. Values below 100 are reset to the default.
+
+`auto_start`                                      *superblink-config.auto_start*
+    Type: boolean
+    Default: `true`
+
+    When true, the server is started automatically on the first completion
+    request if it is not already running.
+
+`ollama_model`                                  *superblink-config.ollama_model*
+    Type: string
+    Default: `"qwen2.5-coder:1.5b"`
+
+    The Ollama model to use for FIM completions. Good alternatives:
+    `qwen2.5-coder:3b`, `starcoder2:3b`, `deepseek-coder-v2:lite`.
+
+`ollama_url`                                      *superblink-config.ollama_url*
+    Type: string
+    Default: `"http://localhost:11434"`
+
+    URL of the Ollama API endpoint.
+
+`max_context_chunks`                      *superblink-config.max_context_chunks*
+    Type: number
+    Default: `8`
+
+    Maximum number of BM25-retrieved code chunks to include in the FIM prompt.
+
+`max_tokens`                                      *superblink-config.max_tokens*
+    Type: number
+    Default: `128`
+
+    Maximum number of tokens for the completion response from Ollama.
+
+`log_level`                                        *superblink-config.log_level*
+    Type: string
+    Default: `"warn"`
+
+    Server log verbosity. One of: `debug`, `info`, `warn`, `error`.
+    Invalid values are reset to `"warn"`.
+
+`python_cmd`                                      *superblink-config.python_cmd*
+    Type: string
+    Default: `"python3"`
+
+    Python executable used to spawn the server. Must be on PATH and be
+    Python >= 3.11. A warning is shown at setup if the executable is not found.
+
+`server_port`                                    *superblink-config.server_port*
+    Type: number
+    Default: `7878`
+
+    Port the server listens on. Must be between 1 and 65535. If you change
+    the port without changing `server_url`, the URL is updated to match.
+
+==============================================================================
+5. COMMANDS                                              *superblink-commands*
+
+All commands are registered by `require("superblink").setup()`.
+
+:SuperblinkStart                                          *:SuperblinkStart*
+    Start the superblink Python server as a background process. If the server
+    is already running, a message is shown and no action is taken.
+
+:SuperblinkStop                                            *:SuperblinkStop*
+    Stop the server. Sends SIGTERM first, then SIGKILL after 2 seconds if
+    the process has not exited.
+
+:SuperblinkRestart                                      *:SuperblinkRestart*
+    Stop the server and start it again after a brief delay (2.5s) to allow
+    the port to be released.
+
+:SuperblinkStatus                                        *:SuperblinkStatus*
+    Query the server's `/status` endpoint and display the current model,
+    Ollama URL, and a list of indexed projects with file and chunk counts.
+
+:SuperblinkIndex                                          *:SuperblinkIndex*
+    Force a re-index of the current project. The project root is determined
+    by `git rev-parse --show-toplevel`. A warning is shown if the current
+    buffer is not inside a git repository.
+
+:SuperblinkLog                                              *:SuperblinkLog*
+    Open the server log file in a horizontal split. The log file is located
+    at `vim.fn.stdpath("log") .. "/superblink.log"`.
+
+:SuperblinkHealth                                        *:SuperblinkHealth*
+    Run `:checkhealth superblink`. This is a convenience alias. See
+    |superblink-troubleshooting| for what the health check covers.
+
+==============================================================================
+6. INDEXING AND RAG                                          *superblink-rag*
+
+When a completion request arrives for a file inside a git repository, the
+server checks whether that project root has been indexed. If not, it walks
+the repository, splits source files into chunks (respecting configurable
+size limits), and builds a BM25 index over those chunks. A filesystem
+watcher is started so the index stays current as files change.
+
+At completion time, the code surrounding the cursor is used as a BM25 query
+to retrieve the most relevant chunks (up to `max_context_chunks`). These
+chunks are prepended to the FIM prompt -- prefix, suffix, and retrieved
+context -- and sent to the Ollama model. The model's response is returned
+as one or two blink.cmp items: the full multi-line completion and, if
+applicable, a single-line variant.
+
+==============================================================================
+7. TROUBLESHOOTING                                *superblink-troubleshooting*
+
+Run `:SuperblinkHealth` (or `:checkhealth superblink`) first. The health
+check verifies:
+
+    - Python executable and version (>= 3.11)
+    - Required Python packages (fastapi, uvicorn, httpx, rank_bm25, watchdog)
+    - Ollama binary or API reachability
+    - Configured model availability in Ollama
+    - Superblink server reachability
+    - blink.cmp installation
+
+Common issues:
+
+Server won't start ~
+    Check `:SuperblinkLog` for errors. Verify the Python executable with
+    `:echo executable('python3')`. Ensure `server/main.py` exists in the
+    plugin directory.
+
+No completions appear ~
+    Run `:SuperblinkStatus` to check the server is running and has indexed
+    your project. Verify blink.cmp has the superblink source registered.
+    Check that Ollama is running and the configured model is pulled.
+
+Slow completions ~
+    Try a smaller model (`qwen2.5-coder:1.5b`). Reduce `max_context_chunks`
+    or `max_tokens`. Check Ollama GPU utilization.
+
+Port already in use ~
+    Another instance may be running. Stop it with `:SuperblinkStop` or kill
+    the process manually. Change `server_port` if needed.
+
+Model not found ~
+    Run `ollama pull <model>` to download it. Check the model name matches
+    exactly (including the tag, e.g. `qwen2.5-coder:1.5b`).
+
+Log file location ~
+    The server log is written to the Neovim log directory: >
+
+        :echo stdpath("log") .. "/superblink.log"
+<
+    Open it directly with `:SuperblinkLog`.
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+httpx
+rank_bm25
+watchdog

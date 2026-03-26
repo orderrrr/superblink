@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+server/*.egg-info/
+.mypy_cache/
+.ruff_cache/
+*.tar.gz
