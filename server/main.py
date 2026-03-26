@@ -246,8 +246,34 @@ class ProjectIndex:
     _bm25_dirty: bool = False
     _last_bm25_rebuild: float = 0.0
 
+    def _git_tracked_files(self, root: Path) -> list[Path] | None:
+        """Return tracked files via `git ls-files`, or None if not a git repo."""
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+            paths = []
+            for rel in result.stdout.split("\0"):
+                rel = rel.strip()
+                if not rel:
+                    continue
+                p = root / rel
+                if p.suffix in CODE_EXTENSIONS:
+                    paths.append(p)
+            return paths
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+
     def build(self):
-        """Full index build from disk."""
+        """Full index build from disk. Uses git ls-files when available."""
         t0 = time.time()
         self.chunks.clear()
         self.file_hashes.clear()
@@ -255,20 +281,35 @@ class ProjectIndex:
         root = Path(self.root)
         file_count = 0
 
-        for path in root.rglob("*"):
-            if any(part in IGNORE_DIRS for part in path.parts):
-                continue
-            if path.suffix not in CODE_EXTENSIONS or not path.is_file():
-                continue
-            # Skip large files (generated code, vendored, etc.)
-            try:
-                if path.stat().st_size > MAX_FILE_SIZE:
+        tracked = self._git_tracked_files(root)
+        if tracked is not None:
+            log.info(
+                f"Using git ls-files: {len(tracked)} tracked code files in {self.root}"
+            )
+            for path in tracked:
+                if not path.is_file():
                     continue
-            except OSError:
-                continue
-
-            self._index_file(path, root)
-            file_count += 1
+                try:
+                    if path.stat().st_size > MAX_FILE_SIZE:
+                        continue
+                except OSError:
+                    continue
+                self._index_file(path, root)
+                file_count += 1
+        else:
+            log.info(f"No git repo, falling back to rglob for {self.root}")
+            for path in root.rglob("*"):
+                if any(part in IGNORE_DIRS for part in path.parts):
+                    continue
+                if path.suffix not in CODE_EXTENSIONS or not path.is_file():
+                    continue
+                try:
+                    if path.stat().st_size > MAX_FILE_SIZE:
+                        continue
+                except OSError:
+                    continue
+                self._index_file(path, root)
+                file_count += 1
 
         self._rebuild_bm25()
         elapsed = time.time() - t0
@@ -393,6 +434,16 @@ class ProjectWatcher(FileSystemEventHandler):
 projects: dict[str, ProjectIndex] = {}
 observers: dict[str, Observer] = {}
 
+# Tracks the latest completion request. When a new request arrives,
+# the previous one's asyncio task gets cancelled so it doesn't
+# queue behind on Ollama.
+import asyncio
+
+_active_completion: asyncio.Task | None = None
+_completion_seq: int = 0
+
+SUFFIX_MAX_LINES = 20  # Only send ~20 lines after cursor to keep prompt small
+
 
 def get_or_create_index(project_root: str) -> ProjectIndex:
     project_root = str(Path(project_root).resolve())
@@ -470,6 +521,18 @@ class CompletionResponse(BaseModel):
 
 @app.post("/complete", response_model=CompletionResponse)
 async def complete(req: CompletionRequest):
+    global _active_completion, _completion_seq
+
+    # Cancel any in-flight completion so it doesn't hog Ollama
+    _completion_seq += 1
+    my_seq = _completion_seq
+    if _active_completion and not _active_completion.done():
+        _active_completion.cancel()
+        log.info("Cancelled previous completion (superseded by seq=%d)", my_seq)
+
+    task = asyncio.current_task()
+    _active_completion = task
+
     t0 = time.time()
 
     if not req.content.strip() or not req.filepath.strip():
@@ -482,7 +545,6 @@ async def complete(req: CompletionRequest):
 
     root = req.project_root or detect_git_root(req.filepath)
     if not root:
-        # Fallback to parent dir, but log a warning
         root = str(Path(req.filepath).parent)
         log.warning(f"No git root found for {req.filepath}, falling back to {root}")
 
@@ -497,9 +559,12 @@ async def complete(req: CompletionRequest):
     current = lines[cursor_line] if cursor_line < len(lines) else ""
     prefix_lines.append(current[:cursor_col])
 
+    # Trim suffix to nearby lines — the full file tail bloats the prompt
+    # and slows down Ollama's prompt processing with no quality benefit.
+    suffix_end = min(cursor_line + 1 + SUFFIX_MAX_LINES, len(lines))
     suffix_lines = [current[cursor_col:]]
     if cursor_line + 1 < len(lines):
-        suffix_lines.extend(lines[cursor_line + 1 :])
+        suffix_lines.extend(lines[cursor_line + 1 : suffix_end])
 
     prefix = "\n".join(prefix_lines)
     suffix = "\n".join(suffix_lines)
@@ -543,16 +608,28 @@ async def complete(req: CompletionRequest):
     )
 
     log.info(
-        "prompt: %d chars, rag: %d chars, chunks: %d",
+        "seq=%d prompt: %d chars, rag: %d chars, suffix: %d chars, chunks: %d",
+        my_seq,
         len(prompt),
         len(rag_block),
+        len(suffix),
         len(chunks),
     )
 
-    # --- Call Ollama ---
-    completion = await _ollama_generate(prompt, tpl)
+    # --- Call Ollama (cancellable via asyncio task cancellation) ---
+    try:
+        completion = await _ollama_generate(prompt, tpl)
+    except asyncio.CancelledError:
+        log.info("seq=%d cancelled during Ollama inference", my_seq)
+        return CompletionResponse(
+            completion="",
+            chunks_used=len(chunks),
+            model=OLLAMA_MODEL,
+            elapsed_ms=round((time.time() - t0) * 1000, 1),
+        )
 
     elapsed = (time.time() - t0) * 1000
+    log.info("seq=%d completed in %.0fms: %d chars", my_seq, elapsed, len(completion))
     return CompletionResponse(
         completion=completion,
         chunks_used=len(chunks),
@@ -563,7 +640,7 @@ async def complete(req: CompletionRequest):
 
 async def _ollama_generate(prompt: str, tpl: dict) -> str:
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={
