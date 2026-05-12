@@ -66,6 +66,75 @@ function M.setup(opts)
     vim.cmd("checkhealth superblink")
   end, { desc = "Run superblink health checks" })
 
+  vim.api.nvim_create_user_command("SuperblinkDebug", function(opts)
+    local include_prompt = opts.bang
+    local url = config.server_url .. "/debug/last"
+    if include_prompt then
+      url = url .. "?include_prompt=true"
+    end
+    local curl_path = vim.fn.exepath("curl") or "curl"
+    vim.system({ curl_path, "-s", url }, { text = true }, function(result)
+      vim.schedule(function()
+        if result.code ~= 0 or not result.stdout or result.stdout == "" then
+          vim.notify("[superblink] debug: server not reachable", vim.log.levels.WARN)
+          return
+        end
+        local ok, data = pcall(vim.fn.json_decode, result.stdout)
+        if not ok or not data then
+          vim.notify("[superblink] debug: bad response", vim.log.levels.WARN)
+          return
+        end
+        if data.error then
+          vim.notify("[superblink] " .. data.error, vim.log.levels.INFO)
+          return
+        end
+
+        -- Format into a readable buffer
+        local lines = { "superblink — last completion debug" , "" }
+
+        table.insert(lines, string.format("seq:       %d", data.seq or 0))
+        table.insert(lines, string.format("file:      %s", data.filepath or "?"))
+        table.insert(lines, string.format("cursor:    line %d, col %d", (data.cursor or {}).line or 0, (data.cursor or {}).col or 0))
+        table.insert(lines, string.format("model:     %s", data.model or "?"))
+        table.insert(lines, string.format("total:     %.0fms (ollama: %.0fms)", data.total_ms or 0, data.ollama_ms or 0))
+        table.insert(lines, "")
+        table.insert(lines, string.format("prompt:    %d chars (~%d tokens)", data.prompt_chars or 0, data.prompt_tokens_approx or 0))
+        table.insert(lines, string.format("  rag:     %d chars", data.rag_chars or 0))
+        table.insert(lines, string.format("  prefix:  %d chars", data.prefix_chars or 0))
+        table.insert(lines, string.format("  suffix:  %d chars (capped at %d lines)", data.suffix_chars or 0, data.suffix_lines_cap or 0))
+        table.insert(lines, "")
+        table.insert(lines, string.format("completion: %s", vim.inspect(data.completion or "")))
+        table.insert(lines, "")
+
+        table.insert(lines, string.format("bm25 query: lines %d–%d", (data.bm25_query_lines or {})[1] or 0, (data.bm25_query_lines or {})[2] or 0))
+        table.insert(lines, string.format("chunks: %d", #(data.chunks or {})))
+        for i, c in ipairs(data.chunks or {}) do
+          table.insert(lines, string.format("  [%d] %s:%d (%d chars)", i, c.file, c.line, c.chars))
+          table.insert(lines, "      " .. c.preview:gsub("\n", "\\n"))
+        end
+
+        if data.prompt then
+          table.insert(lines, "")
+          table.insert(lines, "--- full prompt ---")
+          for _, l in ipairs(vim.split(data.prompt, "\n")) do
+            table.insert(lines, l)
+          end
+        end
+
+        -- Open in a scratch buffer
+        vim.cmd("botright new")
+        local buf = vim.api.nvim_get_current_buf()
+        vim.bo[buf].buftype = "nofile"
+        vim.bo[buf].bufhidden = "wipe"
+        vim.bo[buf].swapfile = false
+        vim.bo[buf].filetype = "markdown"
+        vim.api.nvim_buf_set_name(buf, "superblink://debug")
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        vim.bo[buf].modifiable = false
+      end)
+    end)
+  end, { bang = true, desc = "Show debug info for last completion (:SuperblinkDebug! includes full prompt)" })
+
   -- Clean up on exit
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = vim.api.nvim_create_augroup("superblink_cleanup", { clear = true }),

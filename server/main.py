@@ -441,8 +441,11 @@ import asyncio
 
 _active_completion: asyncio.Task | None = None
 _completion_seq: int = 0
+_last_debug: dict | None = None  # stores debug info from the most recent completion
 
 SUFFIX_MAX_LINES = 20  # Only send ~20 lines after cursor to keep prompt small
+PREFIX_NEARBY_LINES = 60  # Lines immediately above cursor to always include
+PREFIX_HEADER_LINES = 30  # Lines from top of file (imports/package) to include
 
 
 def get_or_create_index(project_root: str) -> ProjectIndex:
@@ -555,8 +558,17 @@ async def complete(req: CompletionRequest):
     cursor_line = max(0, min(req.line, len(lines) - 1))
     cursor_col = max(0, req.col)
 
-    prefix_lines = lines[:cursor_line]
+    # Build prefix: file header (imports) + nearby lines above cursor.
+    # For small files or cursors near the top, this naturally includes everything.
     current = lines[cursor_line] if cursor_line < len(lines) else ""
+    if cursor_line <= PREFIX_HEADER_LINES + PREFIX_NEARBY_LINES:
+        # Close to top — just use everything above cursor
+        prefix_lines = lines[:cursor_line]
+    else:
+        header = lines[:PREFIX_HEADER_LINES]
+        nearby_start = cursor_line - PREFIX_NEARBY_LINES
+        nearby = lines[nearby_start:cursor_line]
+        prefix_lines = header + ["", "// ...", ""] + nearby
     prefix_lines.append(current[:cursor_col])
 
     # Trim suffix to nearby lines — the full file tail bloats the prompt
@@ -617,6 +629,7 @@ async def complete(req: CompletionRequest):
     )
 
     # --- Call Ollama (cancellable via asyncio task cancellation) ---
+    t_ollama = time.time()
     try:
         completion = await _ollama_generate(prompt, tpl)
     except asyncio.CancelledError:
@@ -627,9 +640,40 @@ async def complete(req: CompletionRequest):
             model=OLLAMA_MODEL,
             elapsed_ms=round((time.time() - t0) * 1000, 1),
         )
+    ollama_ms = (time.time() - t_ollama) * 1000
 
     elapsed = (time.time() - t0) * 1000
     log.info("seq=%d completed in %.0fms: %d chars", my_seq, elapsed, len(completion))
+
+    # Store debug snapshot for /debug/last
+    global _last_debug
+    _last_debug = {
+        "seq": my_seq,
+        "filepath": rel_path,
+        "cursor": {"line": cursor_line, "col": cursor_col},
+        "bm25_query_lines": [ctx_start, ctx_end],
+        "chunks": [
+            {
+                "file": c.filepath,
+                "line": c.lineno,
+                "chars": len(c.content),
+                "preview": c.content[:120],
+            }
+            for c in chunks
+        ],
+        "prompt_chars": len(prompt),
+        "prompt_tokens_approx": len(prompt) // 4,
+        "rag_chars": len(rag_block),
+        "prefix_chars": len(prefix),
+        "suffix_chars": len(suffix),
+        "suffix_lines_cap": SUFFIX_MAX_LINES,
+        "model": OLLAMA_MODEL,
+        "ollama_ms": round(ollama_ms, 1),
+        "total_ms": round(elapsed, 1),
+        "completion": completion,
+        "prompt": prompt,
+    }
+
     return CompletionResponse(
         completion=completion,
         chunks_used=len(chunks),
@@ -719,6 +763,17 @@ async def index_project(req: IndexRequest):
         "files": len(index.file_hashes),
         "chunks": len(index.chunks),
     }
+
+
+@app.get("/debug/last")
+async def debug_last(include_prompt: bool = False):
+    """Return debug info from the most recent completion request."""
+    if not _last_debug:
+        return {"error": "no completions yet"}
+    out = {k: v for k, v in _last_debug.items() if k != "prompt"}
+    if include_prompt:
+        out["prompt"] = _last_debug["prompt"]
+    return out
 
 
 @app.get("/health")

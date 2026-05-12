@@ -180,12 +180,13 @@ function source:_do_request(context, bufnr, filepath, callback)
         local now_before = now_cursor_line:sub(1, now_col)
         local keyword = now_before:match("[%w_]+$") or ""
 
-        -- Insert at current cursor position, replacing to end of line.
-        local eol = #now_cursor_line
+        -- FIM: insert at cursor without replacing the suffix.
+        -- The model saw the suffix and generated what belongs between
+        -- prefix and suffix, so existing text after cursor must stay.
         local text_edit = {
           range = {
             start = { line = now_line_nr - 1, character = now_col },
-            ["end"] = { line = now_line_nr - 1, character = eol },
+            ["end"] = { line = now_line_nr - 1, character = now_col },
           },
           newText = completion,
         }
